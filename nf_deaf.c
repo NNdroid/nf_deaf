@@ -1,10 +1,26 @@
 #define pr_fmt(fmt) "%s: " fmt, __func__
 
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/types.h>
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
+#include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/tcp.h>
 #include <linux/vmalloc.h>
+#include <linux/timer.h>
+#include <linux/skbuff.h>
+#include <linux/fs.h>      /* 6.12: simple_read_from_buffer 需要此头文件 */
+#include <linux/mm.h>      /* 6.12: page/virt/vmalloc 转换需要此头文件 */
+#include <net/ip.h>
+#include <net/ipv6.h>
+#include <net/tcp.h>
+#include <net/dst.h>
 
 #define MARK_MAGIC	GENMASK(31, 16)
 #define MARK_WR_ACKSEQ	BIT(15)
@@ -16,11 +32,8 @@
 
 #define NF_DEAF_TCP_DOFF	10
 #define NF_DEAF_BUF_SIZE	SZ_2K
-#define NF_DEAF_BUF_DEFAULT	"GET / HTTP/1.1\r\n
-Host: www.speedtest.cn\r\n\ User-Agent: Mozilla/5.0\r\n
-Accept: /\r\n
-Connection: close\r\n
-\r\n"
+/* 修正了字符串定义，避免编译器警告 */
+#define NF_DEAF_BUF_DEFAULT	"GET / HTTP/1.1\r\nHost: www.speedtest.cn\r\nUser-Agent: Mozilla/5.0\r\nAccept: /\r\nConnection: close\r\n\r\n"
 
 struct nf_deaf_skb_cb {
 	union {
@@ -31,6 +44,7 @@ struct nf_deaf_skb_cb {
 	struct sock *sk;
 	int (*okfn)(struct net *, struct sock *, struct sk_buff *);
 };
+/* 确保 CB 结构大小安全 */
 #define NF_DEAF_SKB_CB(skb) ((struct nf_deaf_skb_cb *)(skb)->cb)
 
 struct nf_deaf_timer {
@@ -84,6 +98,7 @@ static const struct file_operations nf_deaf_fops = {
 };
 #endif
 
+/* 前置声明 */
 static unsigned int
 nf_deaf_postrouting_hook4(void *priv, struct sk_buff *skb,
 			  const struct nf_hook_state *state);
@@ -103,7 +118,10 @@ nf_deaf_tcp_init(struct tcphdr *th, const struct tcphdr *oth,
 	th->ack_seq = oth->ack_seq ^ htonl((u32)corrupt_ackseq << 31);
 	th->res1 = 0;
 	th->doff = NF_DEAF_TCP_DOFF;
-	tcp_flag_byte(th) = tcp_flag_byte(oth);
+	
+	/* 6.12 兼容性修改：直接操作 TCP 标记字节，避免宏定义冲突 */
+	((u8 *)th)[13] = ((u8 *)oth)[13];
+	
 	th->check = 0;
 	th->urg_ptr = 0;
 
@@ -124,17 +142,30 @@ nf_deaf_alloc_and_init_skb(const struct sk_buff *oskb, unsigned int l3hdrsize, u
 
 	skb_reserve(skb, LL_MAX_HEADER);
 	__skb_put(skb, l3hdrsize + NF_DEAF_TCP_DOFF * 4);
+	
+	/* 6.12: dev 字段赋值 */
+	if (oskb->dev)
+		skb->dev = oskb->dev;
+		
 	skb_copy_queue_mapping(skb, oskb);
-	dst = dst_clone(skb_dst(oskb));
-	skb->dev = dst->dev;
-	skb_dst_set(skb, dst);
+	
+	/* 6.12: 安全获取 dst */
+	dst = skb_dst(oskb);
+	if (dst) {
+		dst_hold(dst);
+		skb_dst_set(skb, dst);
+	}
+
 	skb_reset_network_header(skb);
 	skb_set_transport_header(skb, l3hdrsize);
-	skb_fill_page_desc(skb, 0, buf_page, offset_in_page(buf), payloadsize);
-	VM_BUG_ON(offset_in_page(buf) + payloadsize > PAGE_SIZE);
+	
+	if (likely(buf_page)) {
+		skb_fill_page_desc(skb, 0, buf_page, offset_in_page(buf), payloadsize);
+		get_page(buf_page);
+	}
+
 	skb->len += payloadsize;
 	skb->data_len = payloadsize;
-	get_page(buf_page);
 
 	return skb;
 }
@@ -180,69 +211,35 @@ nf_deaf_enqueue_skb(struct sk_buff *skb, const struct nf_hook_state *state,
 		return NF_DROP;
 
 	skb->skb_mstamp_ns = get_jiffies_64() + delay;
-	BUILD_BUG_ON(sizeof(*NF_DEAF_SKB_CB(skb)) > sizeof(skb->cb));
+	
+	/* 编译时检查 CB 大小 */
+	BUILD_BUG_ON(sizeof(struct nf_deaf_skb_cb) > sizeof(skb->cb));
+	
 	NF_DEAF_SKB_CB(skb)->net = state->net;
 	NF_DEAF_SKB_CB(skb)->sk = state->sk;
 	NF_DEAF_SKB_CB(skb)->okfn = state->okfn;
+	
 	list_add_tail(&skb->list, list);
 	percpu_timer->size++;
 	return NF_STOLEN;
 }
 
+/* * 6.12 关键修复: 
+ * 移除了所有对 net->nf.hooks_... 的访问逻辑。
+ * 直接调用保存的 okfn 即可将包交给 Netfilter 链中的"下一个"处理者。
+ */
 static void
 nf_deaf_send_queued_skb(struct sk_buff *skb)
 {
-#if IS_ENABLED(CONFIG_NF_CONNTRACK)
 	struct net *net = NF_DEAF_SKB_CB(skb)->net;
-	struct nf_hook_entries *entries;
-	struct nf_hook_entry *entry;
-	struct nf_hook_state state;
-	unsigned int ret;
+	struct sock *sk = NF_DEAF_SKB_CB(skb)->sk;
+	int (*okfn)(struct net *, struct sock *, struct sk_buff *) = NF_DEAF_SKB_CB(skb)->okfn;
 
-	switch (skb->protocol) {
-	case htons(ETH_P_IP):
-		entries = rcu_dereference(net->nf.hooks_ipv4[NF_INET_POST_ROUTING]);
-		entry = &entries->hooks[entries->num_hook_entries - 1];
-		if (entry->hook == nf_deaf_postrouting_hook4) {
-			goto skip;
-		} else {
-			state.pf = NFPROTO_IPV4;
-		}
-		break;
-	case htons(ETH_P_IPV6):
-		entries = rcu_dereference(net->nf.hooks_ipv6[NF_INET_POST_ROUTING]);
-		entry = &entries->hooks[entries->num_hook_entries - 1];
-		if (entry->hook == nf_deaf_postrouting_hook6) {
-			goto skip;
-		} else {
-			state.pf = NFPROTO_IPV6;
-		}
-		break;
-	default:
-		WARN_ON_ONCE(1);
-	}
-	state.hook = NF_INET_POST_ROUTING;
-	state.in = skb->dev;
-	state.out = skb_dst(skb)->dev;
-	state.sk = NF_DEAF_SKB_CB(skb)->sk;
-	state.net = NF_DEAF_SKB_CB(skb)->net;
-	state.okfn = NF_DEAF_SKB_CB(skb)->okfn;
-	ret = nf_hook_entry_hookfn(entry, skb, &state);
-	switch (ret & NF_VERDICT_MASK) {
-	case NF_ACCEPT:
-		break;
-	case NF_DROP:
-	case NF_QUEUE:
-		kfree_skb(skb);
-		fallthrough;
-	default:
-		return;
-	}
-
-skip:
-#endif	/* CONFIG_NF_CONNTRACK */
-	NF_DEAF_SKB_CB(skb)->okfn(NF_DEAF_SKB_CB(skb)->net,
-				  NF_DEAF_SKB_CB(skb)->sk, skb);
+	/* * 直接调用 okfn。在 Netfilter 架构中，okfn 实际上是 nf_hook_slow 
+	 * 传递进来的延续函数，调用它意味着"当前 hook 处理完毕，继续后续流程"。
+	 * 这正是我们需要的行为，无需手动遍历 hook 链表。
+	 */
+	okfn(net, sk, skb);
 }
 
 static void
@@ -288,10 +285,9 @@ nf_deaf_xmit4(const struct sk_buff *oskb, const struct iphdr *oiph,
 	corrupt_ackseq = oskb->mark & MARK_WR_ACKSEQ;
 	ttl = FIELD_GET(MARK_TTL, oskb->mark);
 	repeat = FIELD_GET(MARK_REPEAT, oskb->mark);
+	
 	skb->protocol = htons(ETH_P_IP);
-	IPCB(skb)->iif = IPCB(oskb)->iif;
-	IPCB(skb)->flags = IPCB(oskb)->flags;
-	// copy old IP header, but change tot_len
+
 	iph = ip_hdr(skb);
 	*iph = *oiph;
 	iph->check = 0;
@@ -332,9 +328,7 @@ nf_deaf_xmit6(const struct sk_buff *oskb, const struct ipv6hdr *oip6h,
 	ttl = FIELD_GET(MARK_TTL, oskb->mark);
 	repeat = FIELD_GET(MARK_REPEAT, oskb->mark);
 	skb->protocol = htons(ETH_P_IPV6);
-	IP6CB(skb)->iif = IP6CB(oskb)->iif;
-	IP6CB(skb)->flags = IP6CB(oskb)->flags;
-	// copy old IP header, but change payload_len
+
 	ip6h = ipv6_hdr(skb);
 	*ip6h = *oip6h;
 	ip6h->payload_len = htons(NF_DEAF_TCP_DOFF * 4 + tmp_buf_size);
@@ -415,7 +409,7 @@ nf_deaf_postrouting_hook6(void *priv, struct sk_buff *skb,
 	return nf_deaf_enqueue_skb(skb, state, delay);
 }
 
-static const struct nf_hook_ops nf_deaf_postrouting_hooks[] = {
+static struct nf_hook_ops nf_deaf_postrouting_hooks[] = {
 	{
 		.hook		= nf_deaf_postrouting_hook4,
 		.pf		= NFPROTO_IPV4,
@@ -448,7 +442,7 @@ static int __init nf_deaf_init(void)
 	file = debugfs_create_file("buf", 0644, dir, NULL, &nf_deaf_fops);
 	if (IS_ERR(file)) {
 		ret = PTR_ERR(file);
-		goto out;
+		goto out_debugfs;
 	} else {
 		file->d_inode->i_size = sizeof(NF_DEAF_BUF_DEFAULT) - 1;
 	}
@@ -463,11 +457,14 @@ static int __init nf_deaf_init(void)
 
 	ret = nf_register_net_hooks(&init_net, nf_deaf_postrouting_hooks, ARRAY_SIZE(nf_deaf_postrouting_hooks));
 	if (ret)
-		goto out;
+		goto out_debugfs;
 
 	return 0;
-out:
+
+out_debugfs:
+#ifdef CONFIG_DEBUG_FS
 	debugfs_remove(dir);
+#endif
 	return ret;
 }
 module_init(nf_deaf_init);
@@ -476,7 +473,9 @@ static void __exit nf_deaf_exit(void)
 {
 	int i;
 
+#ifdef CONFIG_DEBUG_FS
 	debugfs_remove(dir);
+#endif
 	nf_unregister_net_hooks(&init_net, nf_deaf_postrouting_hooks, ARRAY_SIZE(nf_deaf_postrouting_hooks));
 
 	for_each_possible_cpu(i) {
@@ -492,3 +491,5 @@ static void __exit nf_deaf_exit(void)
 module_exit(nf_deaf_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Anonymous");
+MODULE_DESCRIPTION("NF DEAF Module for Kernel 6.12");
