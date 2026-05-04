@@ -33,7 +33,7 @@
 #define NF_DEAF_TCP_DOFF	10
 #define NF_DEAF_BUF_SIZE	SZ_2K
 /* 修正了字符串定义，避免编译器警告 */
-#define NF_DEAF_BUF_DEFAULT	"GET / HTTP/1.1\r\nHost: www.speedtest.cn\r\nUser-Agent: Mozilla/5.0\r\nAccept: /\r\nConnection: close\r\n\r\n"
+#define NF_DEAF_BUF_DEFAULT	"GET / HTTP/2\r\nHost: node-36-250-1-90.speedtest.cn\r\nUser-Agent: Mozilla/5.0\r\nAccept: /\r\nConnection: close\r\n\r\n"
 
 struct nf_deaf_skb_cb {
 	union {
@@ -245,7 +245,8 @@ nf_deaf_send_queued_skb(struct sk_buff *skb)
 static void
 nf_deaf_dequeue_skb(struct timer_list *timer)
 {
-	struct nf_deaf_timer *percpu_timer = from_timer(percpu_timer, timer, timer);
+	/* 6.16+ 兼容修复：由于 from_timer 已被内核移除，换用更底层的 container_of 宏完美兼容 */
+	struct nf_deaf_timer *percpu_timer = container_of(timer, struct nf_deaf_timer, timer);
 	struct list_head *list = &percpu_timer->list;
 	struct sk_buff *skb, *tmp;
 	u64 now;
@@ -482,7 +483,8 @@ static void __exit nf_deaf_exit(void)
 		struct nf_deaf_timer *percpu_timer = per_cpu_ptr(&skb_tx_timer, i);
 		struct sk_buff *skb, *tmp;
 
-		del_timer_sync(&percpu_timer->timer);
+		/* 6.15+ 兼容：del_timer_sync 已被移除，更名为 timer_delete_sync */
+		timer_delete_sync(&percpu_timer->timer);
 
 		list_for_each_entry_safe(skb, tmp, &percpu_timer->list, list)
 			kfree_skb(skb);
@@ -492,4 +494,4 @@ module_exit(nf_deaf_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Anonymous");
-MODULE_DESCRIPTION("NF DEAF Module for Kernel 6.12");
+MODULE_DESCRIPTION("NF DEAF Module for Kernel 6.12+");
