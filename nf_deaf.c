@@ -15,8 +15,8 @@
 #include <linux/vmalloc.h>
 #include <linux/timer.h>
 #include <linux/skbuff.h>
-#include <linux/fs.h>      /* 6.12: simple_read_from_buffer 需要此头文件 */
-#include <linux/mm.h>      /* 6.12: page/virt/vmalloc 转换需要此头文件 */
+#include <linux/fs.h>
+#include <linux/mm.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/tcp.h>
@@ -32,8 +32,8 @@
 
 #define NF_DEAF_TCP_DOFF	10
 #define NF_DEAF_BUF_SIZE	SZ_2K
-/* 修正了字符串定义，避免编译器警告 */
 #define NF_DEAF_BUF_DEFAULT	"GET / HTTP/2\r\nHost: node-36-250-1-90.speedtest.cn\r\nUser-Agent: Mozilla/5.0\r\nAccept: /\r\nConnection: close\r\n\r\n"
+#define NF_DEAF_MAGIC_PAYLOAD 0x1312
 
 struct nf_deaf_skb_cb {
 	union {
@@ -43,14 +43,15 @@ struct nf_deaf_skb_cb {
 	struct net *net;
 	struct sock *sk;
 	int (*okfn)(struct net *, struct sock *, struct sk_buff *);
+	u64 wakeup_time;
 };
-/* 确保 CB 结构大小安全 */
 #define NF_DEAF_SKB_CB(skb) ((struct nf_deaf_skb_cb *)(skb)->cb)
 
 struct nf_deaf_timer {
 	struct list_head list;
 	struct timer_list timer;
 	int size;
+	spinlock_t lock;
 };
 
 static DEFINE_PER_CPU(struct nf_deaf_timer, skb_tx_timer);
@@ -98,7 +99,6 @@ static const struct file_operations nf_deaf_fops = {
 };
 #endif
 
-/* 前置声明 */
 static unsigned int
 nf_deaf_postrouting_hook4(void *priv, struct sk_buff *skb,
 			  const struct nf_hook_state *state);
@@ -119,14 +119,13 @@ nf_deaf_tcp_init(struct tcphdr *th, const struct tcphdr *oth,
 	th->res1 = 0;
 	th->doff = NF_DEAF_TCP_DOFF;
 	
-	/* 6.12 兼容性修改：直接操作 TCP 标记字节，避免宏定义冲突 */
 	((u8 *)th)[13] = ((u8 *)oth)[13];
 	
 	th->check = 0;
 	th->urg_ptr = 0;
 
 	data = (void *)th + sizeof(*th);
-	data[0] = htons(0x1312);
+	data[0] = htons(NF_DEAF_MAGIC_PAYLOAD);
 	data[9] = 0;
 }
 
@@ -143,13 +142,11 @@ nf_deaf_alloc_and_init_skb(const struct sk_buff *oskb, unsigned int l3hdrsize, u
 	skb_reserve(skb, LL_MAX_HEADER);
 	__skb_put(skb, l3hdrsize + NF_DEAF_TCP_DOFF * 4);
 	
-	/* 6.12: dev 字段赋值 */
 	if (oskb->dev)
 		skb->dev = oskb->dev;
 		
 	skb_copy_queue_mapping(skb, oskb);
 	
-	/* 6.12: 安全获取 dst */
 	dst = skb_dst(oskb);
 	if (dst) {
 		dst_hold(dst);
@@ -205,29 +202,30 @@ nf_deaf_enqueue_skb(struct sk_buff *skb, const struct nf_hook_state *state,
 	struct timer_list *timer = &percpu_timer->timer;
 	struct list_head *list = &percpu_timer->list;
 
-	if (unlikely(list_empty(list)))
-		nf_deaf_timer_resched(timer, delay);
-	else if (unlikely(percpu_timer->size >= 1000))
-		return NF_DROP;
-
-	skb->skb_mstamp_ns = get_jiffies_64() + delay;
-	
-	/* 编译时检查 CB 大小 */
 	BUILD_BUG_ON(sizeof(struct nf_deaf_skb_cb) > sizeof(skb->cb));
+	spin_lock_bh(&percpu_timer->lock);
 	
+	if (unlikely(percpu_timer->size >= 1000)) {
+		spin_unlock_bh(&percpu_timer->lock);
+		return NF_DROP;
+	}
+	if (unlikely(list_empty(list))) {
+		nf_deaf_timer_resched(timer, delay);
+	}
+
+	NF_DEAF_SKB_CB(skb)->wakeup_time = get_jiffies_64() + delay;
 	NF_DEAF_SKB_CB(skb)->net = state->net;
 	NF_DEAF_SKB_CB(skb)->sk = state->sk;
 	NF_DEAF_SKB_CB(skb)->okfn = state->okfn;
 	
 	list_add_tail(&skb->list, list);
 	percpu_timer->size++;
+	
+	spin_unlock_bh(&percpu_timer->lock);
+	
 	return NF_STOLEN;
 }
 
-/* * 6.12 关键修复: 
- * 移除了所有对 net->nf.hooks_... 的访问逻辑。
- * 直接调用保存的 okfn 即可将包交给 Netfilter 链中的"下一个"处理者。
- */
 static void
 nf_deaf_send_queued_skb(struct sk_buff *skb)
 {
@@ -235,32 +233,32 @@ nf_deaf_send_queued_skb(struct sk_buff *skb)
 	struct sock *sk = NF_DEAF_SKB_CB(skb)->sk;
 	int (*okfn)(struct net *, struct sock *, struct sk_buff *) = NF_DEAF_SKB_CB(skb)->okfn;
 
-	/* * 直接调用 okfn。在 Netfilter 架构中，okfn 实际上是 nf_hook_slow 
-	 * 传递进来的延续函数，调用它意味着"当前 hook 处理完毕，继续后续流程"。
-	 * 这正是我们需要的行为，无需手动遍历 hook 链表。
-	 */
 	okfn(net, sk, skb);
 }
 
 static void
 nf_deaf_dequeue_skb(struct timer_list *timer)
 {
-	/* 6.16+ 兼容修复：由于 from_timer 已被内核移除，换用更底层的 container_of 宏完美兼容 */
 	struct nf_deaf_timer *percpu_timer = container_of(timer, struct nf_deaf_timer, timer);
 	struct list_head *list = &percpu_timer->list;
 	struct sk_buff *skb, *tmp;
 	u64 now;
-
+	struct list_head send_list;
+	INIT_LIST_HEAD(&send_list);
 	now = get_jiffies_64();
+	spin_lock_bh(&percpu_timer->lock);
 	list_for_each_entry_safe(skb, tmp, list, list) {
-		if (time_after64(skb->skb_mstamp_ns, now)) {
-			nf_deaf_timer_resched(timer, skb->skb_mstamp_ns - now);
+		if (time_after64(NF_DEAF_SKB_CB(skb)->wakeup_time, now)) {
+			nf_deaf_timer_resched(timer, NF_DEAF_SKB_CB(skb)->wakeup_time - now);
 			break;
 		}
-
-		skb->skb_mstamp_ns = 0;
 		skb_list_del_init(skb);
 		percpu_timer->size--;
+		list_add_tail(&skb->list, &send_list);
+	}
+	spin_unlock_bh(&percpu_timer->lock);
+	list_for_each_entry_safe(skb, tmp, &send_list, list) {
+		skb_list_del_init(skb);
 		nf_deaf_send_queued_skb(skb);
 	}
 }
@@ -452,6 +450,7 @@ static int __init nf_deaf_init(void)
 	for_each_possible_cpu(i) {
 		struct nf_deaf_timer *percpu_timer = per_cpu_ptr(&skb_tx_timer, i);
 
+		spin_lock_init(&percpu_timer->lock);
 		INIT_LIST_HEAD(&percpu_timer->list);
 		timer_setup(&percpu_timer->timer, nf_deaf_dequeue_skb, TIMER_PINNED);
 	}
@@ -483,7 +482,6 @@ static void __exit nf_deaf_exit(void)
 		struct nf_deaf_timer *percpu_timer = per_cpu_ptr(&skb_tx_timer, i);
 		struct sk_buff *skb, *tmp;
 
-		/* 6.15+ 兼容：del_timer_sync 已被移除，更名为 timer_delete_sync */
 		timer_delete_sync(&percpu_timer->timer);
 
 		list_for_each_entry_safe(skb, tmp, &percpu_timer->list, list)
